@@ -10,6 +10,8 @@ import os
 import glob
 import sys
 import re
+import requests
+from random import randrange
 
 
 class TerraformController(IEnvironmentController):
@@ -61,30 +63,88 @@ class TerraformController(IEnvironmentController):
         # build attack range
         self.build()
 
-        # wait
-        self.log.info('Wait for 200 seconds before running simulations.')
-        time.sleep(200)
 
-        # simulate attack
-        # create vars string for custom vars:
-        if 'vars' in test_file:
-            var_str = '$myArgs = @{ '
-            i = 0
-            for key, value in test_file['vars'].items():
-                if i == 0:
-                    var_str += '"' + key + '" = "' + value + '"'
-                    i += 1
-                else:
-                    var_str += '; "' + key + '" = "' + value + '"'
-                    i += 1
+        random_number = str(randrange(10000))
+        folder_name = "attack_data_" + random_number
+        os.mkdir(os.path.join(os.path.dirname(__file__), '../attack_data/' + folder_name))
 
-            var_str += ' }'
-            print(var_str)
+        simulation = False
+        output = 'loaded attack data'
+        if 'attack_data'in test_file:
+            for data in test_file['attack_data']:
+                dumps_yml = self.load_file(os.path.join(os.path.dirname(__file__), '../attack_data/dumps.yml'))
 
-            output = self.simulate(test_file['target'], test_file['simulation_technique'], 'no', var_str)
+                url = data['data']
+                r = requests.get(url, allow_redirects=True)
+                open(os.path.join(os.path.dirname(__file__), '../attack_data/' + folder_name + '/' + data['file_name']), 'wb').write(r.content)
+
+                splunk_ip = aws_service.get_single_instance_public_ip(self.config['range_name'] + "-attack-range-splunk-server", self.config)
+                # Upload the replay logs to the Splunk server
+                ansible_vars = {}
+                ansible_vars['dump_name'] = folder_name
+                ansible_vars['ansible_user'] = 'ubuntu'
+                ansible_vars['ansible_ssh_private_key_file'] = self.config['private_key_path']
+                ansible_vars['splunk_password'] = self.config['attack_range_password']
+                ansible_vars['out'] = data['file_name']
+                ansible_vars['sourcetype'] = data['sourcetype']
+                ansible_vars['source'] = data['source']
+                ansible_vars['index'] = 'test'
+
+                cmdline = "-i %s, -u ubuntu -c paramiko" % (splunk_ip)
+                runner = ansible_runner.run(private_data_dir=os.path.join(os.path.dirname(__file__), '../'),
+                                            cmdline=cmdline,
+                                            roles_path=os.path.join(os.path.dirname(__file__), '../ansible/roles'),
+                                            playbook=os.path.join(os.path.dirname(__file__), '../ansible/playbooks/attack_replay.yml'),
+                                            extravars=ansible_vars)
 
         else:
-            output = self.simulate(test_file['target'],test_file['simulation_technique'], 'no')
+            simulation = True
+
+        # update ESCU
+        if self.config['update_escu_app'] == '1':
+            # upload package
+            splunk_ip = aws_service.get_single_instance_public_ip(self.config['range_name'] + "-attack-range-splunk-server", self.config)
+            # Upload the replay logs to the Splunk server
+            ansible_vars = {}
+            ansible_vars['ansible_user'] = 'ubuntu'
+            ansible_vars['ansible_ssh_private_key_file'] = self.config['private_key_path']
+            ansible_vars['splunk_password'] = self.config['attack_range_password']
+            ansible_vars['security_content_path'] = self.config['security_content_path']
+
+            cmdline = "-i %s, -u ubuntu -c paramiko" % (splunk_ip)
+            runner = ansible_runner.run(private_data_dir=os.path.join(os.path.dirname(__file__), '../'),
+                                        cmdline=cmdline,
+                                        roles_path=os.path.join(os.path.dirname(__file__), '../ansible/roles'),
+                                        playbook=os.path.join(os.path.dirname(__file__), '../ansible/playbooks/update_escu.yml'),
+                                        extravars=ansible_vars)
+
+
+        if simulation:
+
+            # wait
+            self.log.info('Wait for 200 seconds before running simulations.')
+            time.sleep(200)
+
+            # simulate attack
+            # create vars string for custom vars:
+            if 'vars' in test_file:
+                var_str = '$myArgs = @{ '
+                i = 0
+                for key, value in test_file['vars'].items():
+                    if i == 0:
+                        var_str += '"' + key + '" = "' + value + '"'
+                        i += 1
+                    else:
+                        var_str += '; "' + key + '" = "' + value + '"'
+                        i += 1
+
+                var_str += ' }'
+                print(var_str)
+
+                output = self.simulate(test_file['target'], test_file['simulation_technique'], 'no', var_str)
+
+            else:
+                output = self.simulate(test_file['target'],test_file['simulation_technique'], 'no')
 
         # wait
         self.log.info('Wait for 200 seconds before running the detections.')
@@ -94,14 +154,15 @@ class TerraformController(IEnvironmentController):
         result = []
 
         for detection_obj in test_file['detections']:
-            detection_file_name = detection_obj['name'].replace('-','_').replace(' ','_').lower() + '.yml'
+            detection_file_name = detection_obj['file']
             detection = self.load_file(os.path.join(os.path.dirname(__file__), '../../security-content/detections/' + detection_file_name))
             result_obj = dict()
             result_obj['detection'] = detection_obj['name']
+            result_obj['detection_file'] = detection_obj['file']
             instance = aws_service.get_instance_by_name(
                 self.config['range_name'] + "-attack-range-splunk-server", self.config)
             if instance['State']['Name'] == 'running':
-                result_obj['error'], result_obj['results'] = splunk_sdk.test_search(instance['NetworkInterfaces'][0]['Association']['PublicIp'], str(self.config['attack_range_password']), detection['search'], detection_obj['pass_condition'], detection['name'], self.log)
+                result_obj['error'], result_obj['results'] = splunk_sdk.test_search(instance['NetworkInterfaces'][0]['Association']['PublicIp'], str(self.config['attack_range_password']), detection['search'], detection_obj['pass_condition'], detection['name'], detection_obj['file'], self.log)
             else:
                 self.log.error('ERROR: Splunk server is not running.')
             result.append(result_obj)
@@ -114,7 +175,6 @@ class TerraformController(IEnvironmentController):
         self.destroy()
 
         # return results
-        print(output)
         return {'technique': test_file['simulation_technique'], 'results': result , 'simulation_output': output}
 
 
